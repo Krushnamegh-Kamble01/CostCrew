@@ -35,29 +35,53 @@
 ## 🛠️ Tech Stack
 
 ### **Frontend**
-- **Framework:** [Next.js 15 (App Router)](https://nextjs.org/)
-- **Language:** [TypeScript](https://www.typescriptlang.org/)
-- **Styling:** [Tailwind CSS](https://tailwindcss.com/) (Vanilla CSS tokens & Glassmorphic UI)
-- **Icons:** [Lucide React](https://lucide.dev/)
+- **Framework:** Next.js 15 (App Router)
+- **Language:** TypeScript
+- **Styling:** Tailwind CSS (Vanilla CSS tokens & Glassmorphic UI)
+- **Icons:** Lucide React
 
 ### **Backend & Database**
-- **Authentication & Database:** [Supabase](https://supabase.com/) (PostgreSQL + Auth + Row Level Security policies)
+- **Authentication & Database:** Supabase (PostgreSQL + Auth + Row Level Security policies)
 - **API Routes:** Next.js Server-Side API Handlers
 
 ### **Artificial Intelligence**
-- **Receipt Vision Parsing:** [Google Gemini API (`@google/genai`)](https://ai.google.dev/)
+- **Receipt Vision Parsing:** Google Gemini API (`@google/genai`)
 
 ---
 
-## 🚀 Getting Started
+## 🏗️ System Architecture
+
+```mermaid
+graph TD
+    User["User / Client Browser"] --> App["CostCrew App (Next.js)"]
+    
+    App --> Auth["Google Sign-In (Supabase Auth)"]
+    App --> Expenses["Group & Expense Management"]
+    App --> Scanner["AI Receipt Scanner (Gemini API)"]
+    
+    Auth --> DB[("Supabase Postgres DB")]
+    Expenses --> DB
+    Scanner -->|"Extracted Data (Amount, Merchant, Category)"| Expenses
+```
+
+---
+
+## 🚀 Deployment
+
+- **Vercel** — Hosting platform, serverless edge functions, and environment variable configuration.
+- **GitHub** — Source version control and automatic CI trigger for production deployments.
+
+---
+
+## 🏁 Getting Started
 
 ### **Prerequisites**
-- [Node.js](https://nodejs.org/) (v18.x or higher)
+- Node.js (v18.x or higher)
 - `npm` or `yarn`
 
 ### **1. Clone the Repository**
 ```bash
-git clone https://github.com/your-username/CostCrew.git
+git clone https://github.com/Krushnamegh-Kamble01/CostCrew.git
 cd CostCrew
 ```
 
