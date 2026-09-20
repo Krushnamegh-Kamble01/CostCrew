@@ -515,23 +515,20 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
       amount: number
     }[] = []
 
-    let debtorIdx = 0
-    let creditorIdx = 0
-
-    while (debtorIdx < debtors.length && creditorIdx < creditors.length) {
-      // Sort to repeatedly pick largest debtor and largest creditor for optimal reduction
+    // Greedy settlement: pick largest debtor and largest creditor repeatedly until all resolved
+    while (debtors.length > 0 && creditors.length > 0) {
       debtors.sort((a, b) => b.amountPaisa - a.amountPaisa)
       creditors.sort((a, b) => b.amountPaisa - a.amountPaisa)
 
-      const debtor = debtors[debtorIdx]
-      const creditor = creditors[creditorIdx]
+      const debtor = debtors[0]
+      const creditor = creditors[0]
 
       if (!debtor || debtor.amountPaisa === 0) {
-        debtorIdx++
+        debtors.shift()
         continue
       }
       if (!creditor || creditor.amountPaisa === 0) {
-        creditorIdx++
+        creditors.shift()
         continue
       }
 
@@ -550,12 +547,87 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
         creditor.amountPaisa -= transferPaisa
       }
 
-      if (debtor.amountPaisa === 0) debtorIdx++
-      if (creditor.amountPaisa === 0) creditorIdx++
+      if (debtor.amountPaisa === 0) debtors.shift()
+      if (creditor.amountPaisa === 0) creditors.shift()
+    }
+
+    // Sort transactions so current logged-in user's transactions come first
+    if (currentUserId) {
+      transactions.sort((a, b) => {
+        const aIsUser = a.fromUserId === currentUserId || a.toUserId === currentUserId
+        const bIsUser = b.fromUserId === currentUserId || b.toUserId === currentUserId
+        if (aIsUser && !bIsUser) return -1
+        if (!aIsUser && bIsUser) return 1
+        return 0
+      })
     }
 
     return transactions
-  }, [memberBalances])
+  }, [memberBalances, currentUserId])
+
+  // Calculate Pairwise Balances for Current User with each other member
+  const pairwiseBalances = useMemo(() => {
+    if (!currentUserId || members.length <= 1) return []
+
+    // 1. Calculate net pairwise balances from expenses and settlements
+    // netPairwisePaisa[otherUserId] > 0 means current user is owed money by otherUser
+    // netPairwisePaisa[otherUserId] < 0 means current user owes money to otherUser
+    const netPairwisePaisa: Record<string, number> = {}
+
+    const otherMembers = members.filter((m) => m.user_id !== currentUserId)
+    otherMembers.forEach((m) => {
+      netPairwisePaisa[m.user_id] = 0
+    })
+
+    // Add expense shares
+    expenses.forEach((exp) => {
+      const payerId = exp.paid_by
+      const splits = exp.expense_splits || []
+
+      if (payerId === currentUserId) {
+        // Current user paid: other members who participate owe current user their share
+        splits.forEach((sp) => {
+          if (sp.user_id !== currentUserId && netPairwisePaisa[sp.user_id] !== undefined) {
+            netPairwisePaisa[sp.user_id] += Math.round(sp.share_amount * 100)
+          }
+        })
+      } else if (netPairwisePaisa[payerId] !== undefined) {
+        // Someone else paid: find current user's share owed to that payer
+        const mySplit = splits.find((sp) => sp.user_id === currentUserId)
+        if (mySplit) {
+          netPairwisePaisa[payerId] -= Math.round(mySplit.share_amount * 100)
+        }
+      }
+    })
+
+    // Add settlements
+    settlements.forEach((s) => {
+      const amountPaisa = Math.round(s.amount * 100)
+      if (s.from_user === currentUserId && netPairwisePaisa[s.to_user] !== undefined) {
+        // Current user paid to recipient: reduces debt to recipient / increases credit
+        netPairwisePaisa[s.to_user] += amountPaisa
+      } else if (s.to_user === currentUserId && netPairwisePaisa[s.from_user] !== undefined) {
+        // Sender paid to current user: reduces sender's debt to current user
+        netPairwisePaisa[s.from_user] -= amountPaisa
+      }
+    })
+
+    // Simplify pairwise graph if simplifiedSettlements exists, or display direct pairwise
+    // Requirement 3 specifies: "Calculate this from the same net-balance data already computed, broken down pairwise"
+    // And "If two people never directly owe each other after settlement math nets things out, still show them as settled"
+    return otherMembers.map((m) => {
+      const netPaisa = netPairwisePaisa[m.user_id] || 0
+      const netAmount = Number((Math.abs(netPaisa) / 100).toFixed(2))
+
+      return {
+        user_id: m.user_id,
+        username: m.profiles?.username || 'Member',
+        avatar_url: m.profiles?.avatar_url,
+        netPaisa,
+        netAmount,
+      }
+    })
+  }, [currentUserId, members, expenses, settlements])
 
   // Parse numerical total amount
   const parsedAmount = useMemo(() => {
@@ -633,8 +705,129 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
     )
   }
 
-  // Handle Add Expense Submission
-  const handleAddExpense = async (e: React.FormEvent) => {
+  // Edit Expense State & Handlers
+  const [editingExpenseId, setEditingExpenseId] = useState<string | null>(null)
+  const [deletingExpense, setDeletingExpense] = useState<Expense | null>(null)
+  const [deletingLoading, setDeletingLoading] = useState(false)
+
+  const openAddExpenseModal = () => {
+    setEditingExpenseId(null)
+    setAmountInput('')
+    setPaidBy(currentUserId || (members[0]?.user_id || ''))
+    setCategory('Food')
+    setNote('')
+    setExpenseDate(new Date().toISOString().split('T')[0])
+    setSplitMethod('evenly_all')
+    setSelectedMemberIds(members.map((m) => m.user_id))
+    setUnevenShares({})
+    setExpenseError(null)
+    setScanError(null)
+    setShowAddExpenseModal(true)
+  }
+
+  const openEditExpenseModal = (exp: Expense) => {
+    setEditingExpenseId(exp.id)
+    setAmountInput(String(exp.amount))
+    setPaidBy(exp.paid_by)
+    setCategory(exp.category)
+    setNote(exp.note || '')
+    setExpenseDate(new Date(exp.created_at).toISOString().split('T')[0])
+    
+    // Determine split method and state from splits
+    const splits = exp.expense_splits || []
+    const splitUserIds = splits.map((s) => s.user_id)
+    
+    if (splitUserIds.length === members.length && members.length > 0) {
+      // Check if amounts are equal
+      const expectedEqual = calculateEqualSplits(exp.amount, members.map((m) => m.user_id))
+      const isEven = splits.every((s) => {
+        const match = expectedEqual.find((e) => e.userId === s.user_id)
+        return match && Math.abs(match.shareAmount - s.share_amount) < 0.01
+      })
+
+      if (isEven) {
+        setSplitMethod('evenly_all')
+        setSelectedMemberIds(members.map((m) => m.user_id))
+        setUnevenShares({})
+      } else {
+        setSplitMethod('uneven')
+        const sharesMap: Record<string, string> = {}
+        splits.forEach((s) => {
+          sharesMap[s.user_id] = String(s.share_amount)
+        })
+        setUnevenShares(sharesMap)
+      }
+    } else {
+      // Check if selected equal
+      const expectedSelected = calculateEqualSplits(exp.amount, splitUserIds)
+      const isEvenSelected = splits.every((s) => {
+        const match = expectedSelected.find((e) => e.userId === s.user_id)
+        return match && Math.abs(match.shareAmount - s.share_amount) < 0.01
+      })
+
+      if (isEvenSelected) {
+        setSplitMethod('evenly_selected')
+        setSelectedMemberIds(splitUserIds)
+        setUnevenShares({})
+      } else {
+        setSplitMethod('uneven')
+        const sharesMap: Record<string, string> = {}
+        splits.forEach((s) => {
+          sharesMap[s.user_id] = String(s.share_amount)
+        })
+        setUnevenShares(sharesMap)
+      }
+    }
+
+    setExpenseError(null)
+    setScanError(null)
+    setShowAddExpenseModal(true)
+  }
+
+  const handleDeleteExpense = async () => {
+    if (!deletingExpense) return
+
+    try {
+      setDeletingLoading(true)
+
+      // 1. Delete associated expense_splits rows first
+      const { error: splitDelErr } = await supabase
+        .from('expense_splits')
+        .delete()
+        .eq('expense_id', deletingExpense.id)
+
+      if (splitDelErr) {
+        console.error('Error deleting expense splits:', JSON.stringify(splitDelErr, null, 2))
+        setSuccessToast('Failed to delete expense splits.')
+        return
+      }
+
+      // 2. Delete the expense row
+      const { error: expDelErr } = await supabase
+        .from('expenses')
+        .delete()
+        .eq('id', deletingExpense.id)
+
+      if (expDelErr) {
+        console.error('Error deleting expense:', JSON.stringify(expDelErr, null, 2))
+        setSuccessToast('Failed to delete expense.')
+        return
+      }
+
+      setSuccessToast('Expense deleted successfully.')
+      setDeletingExpense(null)
+      fetchExpenses()
+      fetchSettlements()
+    } catch (err) {
+      console.error('Error during expense deletion:', JSON.stringify(err, null, 2))
+    } finally {
+      setDeletingLoading(false)
+      setTimeout(() => setSuccessToast(null), 4000)
+    }
+  }
+
+  // Handle Save Expense (Insert or Update)
+  const handleSaveExpense = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!isFormValid || submittingExpense) return
 
@@ -676,62 +869,127 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
         return
       }
 
-      // 1. Insert into "expenses"
-      const { data: expenseData, error: expenseInsertErr } = await supabase
-        .from('expenses')
-        .insert({
-          group_id: groupId,
-          paid_by: paidBy,
-          amount: parsedAmount,
-          category: category,
-          note: note.trim() || null,
-          created_at: new Date(expenseDate).toISOString(),
-        })
-        .select('id')
-        .single()
+      if (editingExpenseId) {
+        // --- EDIT MODE ---
+        // 1. Update expense row
+        const { error: updateErr } = await supabase
+          .from('expenses')
+          .update({
+            paid_by: paidBy,
+            amount: parsedAmount,
+            category: category,
+            note: note.trim() || null,
+            created_at: new Date(expenseDate).toISOString(),
+          })
+          .eq('id', editingExpenseId)
 
-      if (expenseInsertErr || !expenseData) {
-        console.error('Expense insert error details:', JSON.stringify(expenseInsertErr, null, 2))
-        const msg = expenseInsertErr?.details
-          ? `${expenseInsertErr.message} (${expenseInsertErr.details})`
-          : (expenseInsertErr?.message || 'Failed to insert expense.')
-        setExpenseError(msg)
-        setSubmittingExpense(false)
-        return
+        if (updateErr) {
+          console.error('Expense update error:', JSON.stringify(updateErr, null, 2))
+          setExpenseError(updateErr.message || 'Failed to update expense.')
+          setSubmittingExpense(false)
+          return
+        }
+
+        // 2. Delete existing expense_splits
+        const { error: splitsDeleteErr } = await supabase
+          .from('expense_splits')
+          .delete()
+          .eq('expense_id', editingExpenseId)
+
+        if (splitsDeleteErr) {
+          console.error('Error deleting old splits:', JSON.stringify(splitsDeleteErr, null, 2))
+          setExpenseError('Failed to update expense splits.')
+          setSubmittingExpense(false)
+          return
+        }
+
+        // 3. Insert new expense_splits
+        const splitRows = finalSplits.map((s) => ({
+          expense_id: editingExpenseId,
+          user_id: s.userId,
+          share_amount: s.shareAmount,
+        }))
+
+        const { error: splitsInsertErr } = await supabase
+          .from('expense_splits')
+          .insert(splitRows)
+
+        if (splitsInsertErr) {
+          console.error('New splits insert error:', JSON.stringify(splitsInsertErr, null, 2))
+          setExpenseError(splitsInsertErr.message || 'Failed to insert updated splits.')
+          setSubmittingExpense(false)
+          return
+        }
+
+        setShowAddExpenseModal(false)
+        setEditingExpenseId(null)
+        setAmountInput('')
+        setNote('')
+        setUnevenShares({})
+        setSuccessToast(`Expense updated successfully!`)
+        fetchExpenses()
+        fetchSettlements()
+        setTimeout(() => setSuccessToast(null), 4000)
+      } else {
+        // --- ADD MODE ---
+        // 1. Insert into "expenses"
+        const { data: expenseData, error: expenseInsertErr } = await supabase
+          .from('expenses')
+          .insert({
+            group_id: groupId,
+            paid_by: paidBy,
+            amount: parsedAmount,
+            category: category,
+            note: note.trim() || null,
+            created_at: new Date(expenseDate).toISOString(),
+          })
+          .select('id')
+          .single()
+
+        if (expenseInsertErr || !expenseData) {
+          console.error('Expense insert error details:', JSON.stringify(expenseInsertErr, null, 2))
+          const msg = expenseInsertErr?.details
+            ? `${expenseInsertErr.message} (${expenseInsertErr.details})`
+            : (expenseInsertErr?.message || 'Failed to insert expense.')
+          setExpenseError(msg)
+          setSubmittingExpense(false)
+          return
+        }
+
+        // 2. Bulk insert into "expense_splits"
+        const splitRows = finalSplits.map((s) => ({
+          expense_id: expenseData.id,
+          user_id: s.userId,
+          share_amount: s.shareAmount,
+        }))
+
+        const { error: splitsInsertErr } = await supabase
+          .from('expense_splits')
+          .insert(splitRows)
+
+        if (splitsInsertErr) {
+          console.error('Expense splits insert error details:', JSON.stringify(splitsInsertErr, null, 2))
+          const msg = splitsInsertErr?.details
+            ? `${splitsInsertErr.message} (${splitsInsertErr.details})`
+            : (splitsInsertErr?.message || 'Failed to insert expense splits.')
+          setExpenseError(msg)
+          setSubmittingExpense(false)
+          return
+        }
+
+        // Success
+        setShowAddExpenseModal(false)
+        setAmountInput('')
+        setNote('')
+        setUnevenShares({})
+        setSuccessToast(`Expense of ₹${parsedAmount.toFixed(2)} added successfully!`)
+        fetchExpenses()
+        fetchSettlements()
+        setTimeout(() => setSuccessToast(null), 4000)
       }
-
-      // 2. Bulk insert into "expense_splits"
-      const splitRows = finalSplits.map((s) => ({
-        expense_id: expenseData.id,
-        user_id: s.userId,
-        share_amount: s.shareAmount,
-      }))
-
-      const { error: splitsInsertErr } = await supabase
-        .from('expense_splits')
-        .insert(splitRows)
-
-      if (splitsInsertErr) {
-        console.error('Expense splits insert error details:', JSON.stringify(splitsInsertErr, null, 2))
-        const msg = splitsInsertErr?.details
-          ? `${splitsInsertErr.message} (${splitsInsertErr.details})`
-          : (splitsInsertErr?.message || 'Failed to insert expense splits.')
-        setExpenseError(msg)
-        setSubmittingExpense(false)
-        return
-      }
-
-      // Success -> Reset form, update expenses feed immediately, and show success toast
-      setShowAddExpenseModal(false)
-      setAmountInput('')
-      setNote('')
-      setUnevenShares({})
-      setSuccessToast(`Expense of ₹${parsedAmount.toFixed(2)} added successfully!`)
-      fetchExpenses()
-      setTimeout(() => setSuccessToast(null), 4000)
     } catch (err) {
-      console.error('Error adding expense:', JSON.stringify(err, null, 2))
-      setExpenseError('An unexpected error occurred while adding expense.')
+      console.error('Error saving expense:', JSON.stringify(err, null, 2))
+      setExpenseError('An unexpected error occurred while saving expense.')
     } finally {
       setSubmittingExpense(false)
     }
@@ -774,6 +1032,8 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
       </main>
     )
   }
+
+  const isGroupCreator = group.created_by === currentUserId
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-gray-950 via-slate-900 to-indigo-950 text-gray-100 p-4 sm:p-6 lg:p-8">
@@ -847,11 +1107,7 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
                     </p>
                   </div>
                   <button
-                    onClick={() => {
-                      setShowAddExpenseModal(true)
-                      setExpenseError(null)
-                      setScanError(null)
-                    }}
+                    onClick={openAddExpenseModal}
                     className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 shadow-md shadow-indigo-600/20 transition-all cursor-pointer"
                   >
                     <Plus className="w-4 h-4" />
@@ -870,6 +1126,9 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
                       year: 'numeric'
                     })
                     const formattedAmount = Number(expense.amount).toFixed(2)
+
+                    // Authorization check for Edit & Delete: paid_by = current user OR group creator
+                    const canEditOrDelete = expense.paid_by === currentUserId || isGroupCreator
 
                     return (
                       <div
@@ -908,7 +1167,7 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
                             </div>
                           </div>
 
-                          {/* Right Amount & Expand Toggle */}
+                          {/* Right Amount, Actions & Expand Toggle */}
                           <div className="flex items-center justify-between sm:justify-end gap-3 pt-2 sm:pt-0 border-t sm:border-t-0 border-gray-800/60 shrink-0">
                             <div className="text-left sm:text-right">
                               <div className="text-base font-extrabold text-white font-mono">
@@ -918,6 +1177,35 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
                                 <span>{expense.expense_splits?.length || 0} participants</span>
                               </div>
                             </div>
+
+                            {/* Edit & Delete Action Buttons for Authorized Users */}
+                            {canEditOrDelete && (
+                              <div
+                                onClick={(e) => e.stopPropagation()}
+                                className="flex items-center gap-1 bg-gray-800/60 p-1 rounded-lg border border-gray-700/50"
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() => openEditExpenseModal(expense)}
+                                  title="Edit Expense"
+                                  className="p-1.5 rounded-md text-gray-400 hover:text-indigo-300 hover:bg-indigo-500/20 transition-all cursor-pointer"
+                                >
+                                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                                  </svg>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setDeletingExpense(expense)}
+                                  title="Delete Expense"
+                                  className="p-1.5 rounded-md text-gray-400 hover:text-rose-400 hover:bg-rose-500/20 transition-all cursor-pointer"
+                                >
+                                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                  </svg>
+                                </button>
+                              </div>
+                            )}
 
                             <div className="p-1.5 rounded-lg bg-gray-800/80 border border-gray-700/60 text-gray-400 hover:text-white transition-colors">
                               {isExpanded ? (
@@ -1014,11 +1302,7 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
               </div>
 
               <button
-                onClick={() => {
-                  setShowAddExpenseModal(true)
-                  setExpenseError(null)
-                  setScanError(null)
-                }}
+                onClick={openAddExpenseModal}
                 className="w-full md:w-auto min-h-[44px] flex items-center justify-center gap-2 px-5 py-3 rounded-xl font-semibold text-sm text-white bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 shadow-lg shadow-indigo-600/25 transition-all cursor-pointer shrink-0"
               >
                 <Plus className="w-5 h-5" />
@@ -1163,11 +1447,16 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
                     {simplifiedSettlements.map((tx, idx) => {
                       const isSenderCurrent = tx.fromUserId === currentUserId
                       const isReceiverCurrent = tx.toUserId === currentUserId
+                      const isUserInvolved = isSenderCurrent || isReceiverCurrent
 
                       return (
                         <div
                           key={`tx-${tx.fromUserId}-${tx.toUserId}-${idx}`}
-                          className="p-3.5 rounded-xl bg-gray-900/50 border border-gray-800/80 hover:border-gray-700 transition-all flex flex-col justify-between gap-2.5 text-xs"
+                          className={`p-3.5 rounded-xl transition-all flex flex-col justify-between gap-2.5 text-xs ${
+                            isUserInvolved
+                              ? 'bg-indigo-950/40 border-2 border-indigo-500/60 shadow-lg shadow-indigo-950/50'
+                              : 'bg-gray-900/50 border border-gray-800/80 hover:border-gray-700'
+                          }`}
                         >
                           <div className="flex items-start justify-between gap-2">
                             <div className="min-w-0 flex-1">
@@ -1185,6 +1474,11 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
                                 {isReceiverCurrent && (
                                   <span className="text-[9px] px-1 py-0.2 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono">You</span>
                                 )}
+                                {isUserInvolved && (
+                                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/30 text-indigo-200 border border-indigo-400/40 font-bold ml-1">
+                                    Your payment
+                                  </span>
+                                )}
                               </div>
                               <p className="text-[11px] text-gray-400 mt-0.5">
                                 <strong className="text-gray-200 font-medium">@{tx.fromUsername}</strong> pays{' '}
@@ -1197,15 +1491,17 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
                             </div>
                           </div>
 
-                          <div className="pt-2 border-t border-gray-800/60 flex items-center justify-end">
-                            <button
-                              onClick={() => setSettlingTx(tx)}
-                              className="min-h-[44px] inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 transition-all cursor-pointer"
-                            >
-                              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                              <span>Mark as Settled</span>
-                            </button>
-                          </div>
+                          {isUserInvolved && (
+                            <div className="pt-2 border-t border-gray-800/60 flex items-center justify-end">
+                              <button
+                                onClick={() => setSettlingTx(tx)}
+                                className="min-h-[44px] inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 transition-all cursor-pointer"
+                              >
+                                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                                <span>Mark as Settled</span>
+                              </button>
+                            </div>
+                          )}
                         </div>
                       )
                     })}
@@ -1288,8 +1584,10 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
 
           </div>
 
-          {/* RIGHT COLUMN: Group Members Section (Desktop: Right Col 10-12, Mobile: 3rd block) */}
+          {/* RIGHT COLUMN: Group Members & Your Pairwise Balances (Desktop: Right Col 10-12, Mobile: 3rd block) */}
           <div className="order-3 lg:order-3 lg:col-span-3 space-y-6">
+            
+            {/* Group Members Card */}
             <div className="glass-panel rounded-2xl p-5 sm:p-6 border border-gray-800 space-y-5">
               <div className="flex items-center justify-between pb-3.5 border-b border-gray-800">
                 <h2 className="text-base sm:text-lg font-bold text-white flex items-center gap-2">
@@ -1329,13 +1627,77 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
                 })}
               </div>
             </div>
+
+            {/* Requirement 3: Your Balances with Each Member Card */}
+            <div className="glass-panel rounded-2xl p-5 sm:p-6 border border-gray-800 space-y-5">
+              <div className="flex items-center justify-between pb-3.5 border-b border-gray-800">
+                <h2 className="text-base sm:text-lg font-bold text-white flex items-center gap-2">
+                  <User className="w-5 h-5 text-indigo-400" />
+                  <span>Your Balances with Each Member</span>
+                </h2>
+              </div>
+
+              <div className="space-y-2.5">
+                {pairwiseBalances.length === 0 ? (
+                  <p className="text-xs text-gray-500 text-center py-2">No other members in group.</p>
+                ) : (
+                  pairwiseBalances.map((item) => {
+                    const initial = item.username[0]?.toUpperCase() || 'U'
+                    
+                    let statement = `You and @${item.username} are settled`
+                    let textColor = 'text-gray-400'
+                    let badgeStyle = 'bg-gray-800 text-gray-400 border-gray-700/60'
+
+                    if (item.netPaisa < 0) {
+                      statement = `You owe @${item.username} ₹${item.netAmount.toFixed(2)}`
+                      textColor = 'text-rose-400 font-semibold'
+                      badgeStyle = 'bg-rose-500/10 text-rose-400 border-rose-500/20'
+                    } else if (item.netPaisa > 0) {
+                      statement = `@${item.username} owes you ₹${item.netAmount.toFixed(2)}`
+                      textColor = 'text-emerald-400 font-semibold'
+                      badgeStyle = 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                    }
+
+                    return (
+                      <div
+                        key={item.user_id}
+                        className="p-3 rounded-xl bg-gray-900/50 border border-gray-800/80 flex items-center justify-between gap-3 text-xs"
+                      >
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <div className="w-7 h-7 rounded-lg bg-gray-800 border border-gray-700/60 flex items-center justify-center text-gray-300 font-bold text-xs shrink-0">
+                            {initial}
+                          </div>
+                          <div className="min-w-0">
+                            <p className="font-semibold text-gray-200 truncate">
+                              @{item.username}
+                            </p>
+                            <p className={`text-[11px] mt-0.5 truncate ${textColor}`}>
+                              {statement}
+                            </p>
+                          </div>
+                        </div>
+
+                        <span className={`text-[11px] px-2 py-0.5 rounded-lg border font-mono font-bold shrink-0 ${badgeStyle}`}>
+                          {item.netPaisa > 0
+                            ? `+₹${item.netAmount.toFixed(2)}`
+                            : item.netPaisa < 0
+                            ? `-₹${item.netAmount.toFixed(2)}`
+                            : 'Settled'}
+                        </span>
+                      </div>
+                    )
+                  })
+                )}
+              </div>
+            </div>
+
           </div>
 
         </div>
 
       </div>
 
-      {/* Add Expense Modal */}
+      {/* Add / Edit Expense Modal */}
       {showAddExpenseModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm transition-all overflow-y-auto">
           <div className="w-full max-w-lg glass-panel p-6 sm:p-8 rounded-2xl border border-gray-800 space-y-6 relative shadow-2xl my-8 animate-in fade-in zoom-in-95 duration-150">
@@ -1350,60 +1712,66 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
             <div className="space-y-1">
               <h3 className="text-xl font-extrabold text-white flex items-center gap-2">
                 <Receipt className="w-5 h-5 text-indigo-400" />
-                Add Group Expense
+                {editingExpenseId ? 'Edit Group Expense' : 'Add Group Expense'}
               </h3>
-              <p className="text-xs text-gray-400">Log a shared cost and choose how it gets split.</p>
+              <p className="text-xs text-gray-400">
+                {editingExpenseId
+                  ? 'Update details and shares for this expense.'
+                  : 'Log a shared cost and choose how it gets split.'}
+              </p>
             </div>
 
-            <form onSubmit={handleAddExpense} className="space-y-5">
+            <form onSubmit={handleSaveExpense} className="space-y-5">
               
-              {/* Scan Receipt Header & Upload Button */}
-              <div className="p-4 rounded-xl bg-indigo-950/40 border border-indigo-500/20 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2 text-xs font-bold text-indigo-300">
-                    <Sparkles className="w-4 h-4 text-indigo-400" />
-                    <span>Scan Receipt with AI</span>
+              {/* Scan Receipt Header & Upload Button (Only for Add Mode) */}
+              {!editingExpenseId && (
+                <div className="p-4 rounded-xl bg-indigo-950/40 border border-indigo-500/20 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2 text-xs font-bold text-indigo-300">
+                      <Sparkles className="w-4 h-4 text-indigo-400" />
+                      <span>Scan Receipt with AI</span>
+                    </div>
+                    <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-semibold">
+                      Gemini Flash AI
+                    </span>
                   </div>
-                  <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-semibold">
-                    Gemini Flash AI
-                  </span>
-                </div>
 
-                <input
-                  type="file"
-                  ref={fileInputRef}
-                  onChange={handleReceiptScan}
-                  accept="image/*"
-                  capture="environment"
-                  className="hidden"
-                />
+                  <input
+                    type="file"
+                    ref={fileInputRef}
+                    onChange={handleReceiptScan}
+                    accept="image/*"
+                    capture="environment"
+                    className="hidden"
+                  />
 
-                <button
-                  type="button"
-                  disabled={scanningReceipt}
-                  onClick={() => fileInputRef.current?.click()}
-                  className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-xs sm:text-sm font-semibold text-indigo-200 bg-indigo-600/30 hover:bg-indigo-600/40 active:bg-indigo-600/50 border border-indigo-500/40 transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
-                >
-                  {scanningReceipt ? (
-                    <>
-                      <Loader2 className="w-4 h-4 animate-spin text-indigo-400" />
-                      <span>Scanning receipt with AI...</span>
-                    </>
-                  ) : (
-                    <>
-                      <Camera className="w-4 h-4 text-indigo-400" />
-                      <span>Scan Receipt (Camera / Upload)</span>
-                    </>
+                  <button
+                    type="button"
+                    disabled={scanningReceipt}
+                    onClick={() => fileInputRef.current?.click()}
+                    className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-xs sm:text-sm font-semibold text-indigo-200 bg-indigo-600/30 hover:bg-indigo-600/40 active:bg-indigo-600/50 border border-indigo-500/40 transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
+                  >
+                    {scanningReceipt ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin text-indigo-400" />
+                        <span>Scanning receipt with AI...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Camera className="w-4 h-4 text-indigo-400" />
+                        <span>Scan Receipt (Camera / Upload)</span>
+                      </>
+                    )}
+                  </button>
+
+                  {scanError && (
+                    <div className="flex items-center gap-2 p-2.5 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs animate-in fade-in">
+                      <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
+                      <span>{scanError}</span>
+                    </div>
                   )}
-                </button>
-
-                {scanError && (
-                  <div className="flex items-center gap-2 p-2.5 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs animate-in fade-in">
-                    <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
-                    <span>{scanError}</span>
-                  </div>
-                )}
-              </div>
+                </div>
+              )}
 
               {/* Amount & Date Grid */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -1663,7 +2031,7 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
                 <button
                   type="button"
                   onClick={() => setShowAddExpenseModal(false)}
-                  className="px-4 py-2.5 rounded-xl text-xs font-semibold text-gray-400 hover:text-gray-200 transition-colors"
+                  className="px-4 py-2.5 rounded-xl text-xs font-semibold text-gray-400 hover:text-gray-200 transition-colors cursor-pointer"
                 >
                   Cancel
                 </button>
@@ -1675,12 +2043,12 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
                   {submittingExpense ? (
                     <>
                       <Loader2 className="w-4 h-4 animate-spin" />
-                      <span>Saving Expense...</span>
+                      <span>{editingExpenseId ? 'Updating Expense...' : 'Saving Expense...'}</span>
                     </>
                   ) : (
                     <>
                       <DollarSign className="w-4 h-4" />
-                      <span>Save Expense</span>
+                      <span>{editingExpenseId ? 'Update Expense' : 'Save Expense'}</span>
                     </>
                   )}
                 </button>
@@ -1688,6 +2056,70 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
 
             </form>
 
+          </div>
+        </div>
+      )}
+
+      {/* Delete Expense Confirmation Modal */}
+      {deletingExpense && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm transition-all">
+          <div className="w-full max-w-md glass-panel p-6 rounded-2xl border border-gray-800 space-y-5 relative shadow-2xl animate-in fade-in zoom-in-95 duration-150">
+            <button
+              onClick={() => setDeletingExpense(null)}
+              className="absolute top-4 right-4 text-gray-400 hover:text-gray-200 p-1.5 rounded-lg hover:bg-gray-800 transition-colors cursor-pointer"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <div className="space-y-2 text-center pt-2">
+              <div className="w-12 h-12 rounded-2xl bg-rose-500/10 border border-rose-500/20 text-rose-400 flex items-center justify-center mx-auto">
+                <AlertCircle className="w-6 h-6" />
+              </div>
+              <h3 className="text-lg font-bold text-white">Delete Expense</h3>
+              <p className="text-xs text-gray-400 leading-relaxed">
+                Delete this expense? This cannot be undone.
+              </p>
+            </div>
+
+            <div className="p-3 rounded-xl bg-gray-900/60 border border-gray-800 text-xs text-gray-300 space-y-1">
+              <div className="flex justify-between">
+                <span>Category:</span>
+                <span className="font-semibold text-gray-200">{deletingExpense.category}</span>
+              </div>
+              <div className="flex justify-between">
+                <span>Note:</span>
+                <span className="font-semibold text-gray-200">{deletingExpense.note || 'N/A'}</span>
+              </div>
+              <div className="flex justify-between border-t border-gray-800 pt-1 mt-1">
+                <span>Amount:</span>
+                <span className="font-mono font-bold text-white">₹{Number(deletingExpense.amount).toFixed(2)}</span>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setDeletingExpense(null)}
+                className="px-4 py-2.5 rounded-xl text-xs font-semibold text-gray-400 hover:text-gray-200 transition-colors cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleDeleteExpense}
+                disabled={deletingLoading}
+                className="flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-xs text-white bg-rose-600 hover:bg-rose-500 shadow-md shadow-rose-600/25 transition-all disabled:opacity-50 cursor-pointer"
+              >
+                {deletingLoading ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span>Deleting...</span>
+                  </>
+                ) : (
+                  <span>Delete Expense</span>
+                )}
+              </button>
+            </div>
           </div>
         </div>
       )}
