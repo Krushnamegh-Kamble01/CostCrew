@@ -629,6 +629,23 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
     })
   }, [currentUserId, members, expenses, settlements])
 
+  // Compute DIRECT outgoing pairwise debts for the current user (where netPaisa < 0)
+  const myOutgoingSettlements = useMemo(() => {
+    if (!currentUserId || !currentUserBalance) return []
+    const currentUsername = currentUserBalance.username || 'You'
+
+    return pairwiseBalances
+      .filter((item) => item.netPaisa < 0)
+      .map((item) => ({
+        fromUserId: currentUserId,
+        fromUsername: currentUsername,
+        toUserId: item.user_id,
+        toUsername: item.username,
+        amountPaisa: Math.abs(item.netPaisa),
+        amount: item.netAmount,
+      }))
+  }, [pairwiseBalances, currentUserId, currentUserBalance])
+
   // Parse numerical total amount
   const parsedAmount = useMemo(() => {
     const val = parseFloat(amountInput)
@@ -1442,76 +1459,59 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
               </div>
             </div>
 
-            {/* Simplified Settlement / Settle Up Section */}
+            {/* Direct Pairwise Settlement / Settle Up Section */}
             <div className="glass-panel rounded-2xl p-5 sm:p-6 border border-gray-800 space-y-5">
               <div className="flex items-center justify-between pb-3.5 border-b border-gray-800">
                 <h2 className="text-base sm:text-lg font-bold text-white flex items-center gap-2">
                   <Sparkles className="w-5 h-5 text-indigo-400" />
-                  <span>Settle Up (Simplified Payments)</span>
+                  <span>Settle Up (Your Payments)</span>
                 </h2>
                 <span className="text-xs text-gray-400">
-                  {simplifiedSettlements.length} {simplifiedSettlements.length === 1 ? 'payment' : 'payments'} needed
+                  {myOutgoingSettlements.length} {myOutgoingSettlements.length === 1 ? 'payment' : 'payments'} pending
                 </span>
               </div>
 
-              {simplifiedSettlements.length === 0 ? (
-                /* All Settled Up Friendly State */
+              {myOutgoingSettlements.length === 0 ? (
+                /* User Has No Outgoing Payments Friendly State */
                 <div className="p-5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-center space-y-1.5">
                   <div className="w-9 h-9 rounded-full bg-emerald-500/20 border border-emerald-500/30 flex items-center justify-center text-emerald-400 mx-auto">
                     <Check className="w-4 h-4" />
                   </div>
-                  <h3 className="text-sm font-bold text-emerald-300">Everyone is settled up!</h3>
+                  <h3 className="text-sm font-bold text-emerald-300">You have no pending payments</h3>
                   <p className="text-xs text-emerald-400/80 max-w-sm mx-auto">
-                    There are no pending debts or reimbursements required in this group right now.
+                    {simplifiedSettlements.length === 0
+                      ? 'Everyone is settled up! There are no pending debts in this group.'
+                      : 'You are all settled up with your group members.'}
                   </p>
                 </div>
               ) : (
-                /* Suggested Settlement Payments List */
+                /* User Direct Pairwise Outgoing Payments List */
                 <div className="space-y-3">
                   <p className="text-xs text-gray-400">
-                    Minimum transactions required to fully balance all group members:
+                    Direct debts you owe to each group member:
                   </p>
                   
                   <div className="space-y-2.5">
-                    {simplifiedSettlements.map((tx, idx) => {
-                      const isSenderCurrent = tx.fromUserId === currentUserId
-                      const isReceiverCurrent = tx.toUserId === currentUserId
-                      const isUserInvolved = isSenderCurrent || isReceiverCurrent
-
+                    {myOutgoingSettlements.map((tx, idx) => {
                       return (
                         <div
                           key={`tx-${tx.fromUserId}-${tx.toUserId}-${idx}`}
-                          className={`p-3.5 rounded-xl transition-all flex flex-col justify-between gap-2.5 text-xs ${
-                            isUserInvolved
-                              ? 'bg-indigo-950/40 border-2 border-indigo-500/60 shadow-lg shadow-indigo-950/50'
-                              : 'bg-gray-900/50 border border-gray-800/80 hover:border-gray-700'
-                          }`}
+                          className="p-3.5 rounded-xl bg-indigo-950/40 border-2 border-indigo-500/60 shadow-lg shadow-indigo-950/50 flex flex-col justify-between gap-2.5 text-xs"
                         >
                           <div className="flex items-start justify-between gap-2">
                             <div className="min-w-0 flex-1">
                               <div className="flex flex-wrap items-center gap-1.5 font-semibold text-gray-200">
-                                <span className={`truncate ${isSenderCurrent ? 'text-indigo-300 font-bold' : ''}`}>
+                                <span className="text-indigo-300 font-bold truncate">
                                   @{tx.fromUsername}
                                 </span>
-                                {isSenderCurrent && (
-                                  <span className="text-[9px] px-1 py-0.2 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono">You</span>
-                                )}
+                                <span className="text-[9px] px-1 py-0.2 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono">You</span>
                                 <ArrowRight className="w-3.5 h-3.5 text-gray-500 shrink-0" />
-                                <span className={`truncate ${isReceiverCurrent ? 'text-indigo-300 font-bold' : ''}`}>
+                                <span className="truncate">
                                   @{tx.toUsername}
                                 </span>
-                                {isReceiverCurrent && (
-                                  <span className="text-[9px] px-1 py-0.2 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono">You</span>
-                                )}
-                                {isUserInvolved && (
-                                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/30 text-indigo-200 border border-indigo-400/40 font-bold ml-1">
-                                    Your payment
-                                  </span>
-                                )}
                               </div>
                               <p className="text-[11px] text-gray-400 mt-0.5">
-                                <strong className="text-gray-200 font-medium">@{tx.fromUsername}</strong> pays{' '}
-                                <strong className="text-gray-200 font-medium">@{tx.toUsername}</strong>
+                                You pay <strong className="text-gray-200 font-medium">@{tx.toUsername}</strong>
                               </p>
                             </div>
 
@@ -1520,17 +1520,15 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
                             </div>
                           </div>
 
-                          {isUserInvolved && (
-                            <div className="pt-2 border-t border-gray-800/60 flex items-center justify-end">
-                              <button
-                                onClick={() => setSettlingTx(tx)}
-                                className="min-h-[44px] inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 transition-all cursor-pointer"
-                              >
-                                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                                <span>Mark as Settled</span>
-                              </button>
-                            </div>
-                          )}
+                          <div className="pt-2 border-t border-gray-800/60 flex items-center justify-end">
+                            <button
+                              onClick={() => setSettlingTx(tx)}
+                              className="min-h-[44px] inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 transition-all cursor-pointer"
+                            >
+                              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                              <span>Mark as Settled</span>
+                            </button>
+                          </div>
                         </div>
                       )
                     })}
