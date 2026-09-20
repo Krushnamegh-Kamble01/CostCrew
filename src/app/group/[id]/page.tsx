@@ -709,6 +709,7 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
   const [editingExpenseId, setEditingExpenseId] = useState<string | null>(null)
   const [deletingExpense, setDeletingExpense] = useState<Expense | null>(null)
   const [deletingLoading, setDeletingLoading] = useState(false)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
 
   const openAddExpenseModal = () => {
     setEditingExpenseId(null)
@@ -789,6 +790,7 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
 
     try {
       setDeletingLoading(true)
+      setDeleteError(null)
 
       // 1. Delete associated expense_splits rows first
       const { error: splitDelErr } = await supabase
@@ -798,7 +800,8 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
 
       if (splitDelErr) {
         console.error('Error deleting expense splits:', JSON.stringify(splitDelErr, null, 2))
-        setSuccessToast('Failed to delete expense splits.')
+        const errMsg = splitDelErr.message || 'Failed to delete expense splits.'
+        setDeleteError(`Deletion failed: ${errMsg}`)
         return
       }
 
@@ -810,16 +813,30 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
 
       if (expDelErr) {
         console.error('Error deleting expense:', JSON.stringify(expDelErr, null, 2))
-        setSuccessToast('Failed to delete expense.')
+        const errMsg = expDelErr.message || 'Failed to delete expense.'
+        setDeleteError(`Deletion failed: ${errMsg}`)
+        return
+      }
+
+      // Safeguard Verification: Verify 0 splits remain for deleted expense
+      const { count: remainingSplitsCount, error: verifyErr } = await supabase
+        .from('expense_splits')
+        .select('id', { count: 'exact', head: true })
+        .eq('expense_id', deletingExpense.id)
+
+      if (verifyErr || (remainingSplitsCount !== null && remainingSplitsCount > 0)) {
+        setDeleteError('Split data may be inconsistent — please refresh and check this expense.')
         return
       }
 
       setSuccessToast('Expense deleted successfully.')
       setDeletingExpense(null)
+      setDeleteError(null)
       fetchExpenses()
       fetchSettlements()
-    } catch (err) {
+    } catch (err: any) {
       console.error('Error during expense deletion:', JSON.stringify(err, null, 2))
+      setDeleteError('An unexpected error occurred while deleting expense.')
     } finally {
       setDeletingLoading(false)
       setTimeout(() => setSuccessToast(null), 4000)
@@ -917,6 +934,18 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
         if (splitsInsertErr) {
           console.error('New splits insert error:', JSON.stringify(splitsInsertErr, null, 2))
           setExpenseError(splitsInsertErr.message || 'Failed to insert updated splits.')
+          setSubmittingExpense(false)
+          return
+        }
+
+        // Safeguard Verification: Check that actual split count matches expected participant count
+        const { count: actualSplitCount, error: countErr } = await supabase
+          .from('expense_splits')
+          .select('id', { count: 'exact', head: true })
+          .eq('expense_id', editingExpenseId)
+
+        if (countErr || actualSplitCount !== finalSplits.length) {
+          setExpenseError('Split data may be inconsistent — please refresh and check this expense.')
           setSubmittingExpense(false)
           return
         }
@@ -2095,6 +2124,12 @@ export default function GroupDetailPage({ params }: { params: Promise<{ id: stri
                 <span className="font-mono font-bold text-white">₹{Number(deletingExpense.amount).toFixed(2)}</span>
               </div>
             </div>
+
+            {deleteError && (
+              <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs font-medium">
+                {deleteError}
+              </div>
+            )}
 
             <div className="flex items-center justify-end gap-3 pt-2">
               <button
